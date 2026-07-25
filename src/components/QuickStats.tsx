@@ -11,9 +11,11 @@ import {
 } from "lucide-react";
 import type { NormalizedData } from "@/lib/parser";
 import { earthLaps, moonPercent } from "@/lib/parser";
+import type { RegionCount } from "@/lib/regions";
 
 interface QuickStatsProps {
   data: NormalizedData;
+  topRegions?: RegionCount[];
 }
 
 function StatCard({
@@ -38,10 +40,10 @@ function StatCard({
   );
 }
 
-export default function QuickStats({ data }: QuickStatsProps) {
+export default function QuickStats({ data, topRegions = [] }: QuickStatsProps) {
   const laps = earthLaps(data.totalDistanceKm);
   const moon = moonPercent(data.totalDistanceKm);
-  const top3 = data.topPlaces.slice(0, 3);
+  const top3 = topRegions.slice(0, 3);
 
   const modeTotal = data.activities.reduce(
     (s, a) => s + (a.distanceMeters || a.durationMinutes * 80),
@@ -97,14 +99,14 @@ export default function QuickStats({ data }: QuickStatsProps) {
 
       <StatCard
         icon={<MapPinned className="h-4 w-4 text-amber-400" />}
-        label="최다 방문 Top 3"
+        label="최다 방문 지자체 Top 3"
       >
         {top3.length === 0 ? (
-          <p className="text-sm text-[var(--muted)]">장소 데이터 없음</p>
+          <p className="text-sm text-[var(--muted)]">지자체 분석 중…</p>
         ) : (
           <ol className="space-y-2.5">
             {top3.map((p, i) => (
-              <li key={p.name} className="flex items-baseline gap-2">
+              <li key={p.id} className="flex items-baseline gap-2">
                 <span className="font-display text-lg text-amber-400/90">
                   {i + 1}
                 </span>
@@ -112,7 +114,7 @@ export default function QuickStats({ data }: QuickStatsProps) {
                   {p.name}
                 </span>
                 <span className="shrink-0 text-xs tabular-nums text-[var(--muted)]">
-                  {p.visitCount}회
+                  {p.count.toLocaleString()}
                 </span>
               </li>
             ))}

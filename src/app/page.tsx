@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Compass, RotateCcw, Sparkles } from "lucide-react";
 import DateRangePicker, {
   type DateRangeValue,
@@ -9,16 +9,21 @@ import DateRangePicker, {
 import FileUploader from "@/components/FileUploader";
 import QuickStats from "@/components/QuickStats";
 import StoryCards from "@/components/StoryCards";
+import TopRegionsList from "@/components/TopRegionsList";
 import {
   aggregateBundle,
   parseTimelineFile,
   type TimelineBundle,
 } from "@/lib/parser";
+import {
+  summarizeRegions,
+  type RegionCount,
+} from "@/lib/regions";
 
-const HeatmapView = dynamic(() => import("@/components/HeatmapView"), {
+const LocationMaps = dynamic(() => import("@/components/LocationMaps"), {
   ssr: false,
   loading: () => (
-    <div className="flex h-[420px] items-center justify-center rounded-2xl border border-[var(--border)] bg-[var(--surface)] text-sm text-[var(--muted)]">
+    <div className="flex h-[480px] items-center justify-center rounded-2xl border border-[var(--border)] bg-[var(--surface)] text-sm text-[var(--muted)]">
       지도 로딩 중…
     </div>
   ),
@@ -30,11 +35,42 @@ export default function HomePage() {
   const [isParsing, setIsParsing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [korea, setKorea] = useState<RegionCount[]>([]);
+  const [world, setWorld] = useState<RegionCount[]>([]);
+  const [regionsLoading, setRegionsLoading] = useState(false);
 
   const data = useMemo(
     () => (bundle ? aggregateBundle(bundle, range) : null),
     [bundle, range]
   );
+
+  useEffect(() => {
+    if (!data) {
+      setKorea([]);
+      setWorld([]);
+      return;
+    }
+    let cancelled = false;
+    setRegionsLoading(true);
+    void summarizeRegions(data.coordinates)
+      .then((result) => {
+        if (cancelled) return;
+        setKorea(result.korea);
+        setWorld(result.world);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setKorea([]);
+          setWorld([]);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setRegionsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [data]);
 
   const handleFile = useCallback(async (file: File) => {
     setIsParsing(true);
@@ -68,6 +104,8 @@ export default function HomePage() {
     setRange(null);
     setError(null);
     setProgress(0);
+    setKorea([]);
+    setWorld([]);
   }, []);
 
   return (
@@ -147,14 +185,23 @@ export default function HomePage() {
                 </p>
               </div>
             </div>
-            <QuickStats data={data} />
+            <QuickStats data={data} topRegions={[...korea, ...world]} />
           </section>
 
-          <section>
-            <HeatmapView coordinates={data.coordinates} />
-          </section>
+          <TopRegionsList
+            korea={korea}
+            world={world}
+            loading={regionsLoading}
+          />
 
-          <StoryCards data={data} />
+          <LocationMaps
+            coordinates={data.coordinates}
+            korea={korea}
+            world={world}
+            regionsLoading={regionsLoading}
+          />
+
+          <StoryCards data={data} topRegions={korea.length ? korea : world} />
         </div>
       )}
 

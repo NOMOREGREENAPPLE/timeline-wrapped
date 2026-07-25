@@ -599,7 +599,7 @@ export function aggregateBundle(
   const topPlaces: TopPlace[] = [...placeMap.entries()]
     .map(([name, visitCount]) => ({ name, visitCount }))
     .sort((a, b) => b.visitCount - a.visitCount)
-    .slice(0, 20);
+    .slice(0, 30);
 
   const actMap = new Map<
     string,

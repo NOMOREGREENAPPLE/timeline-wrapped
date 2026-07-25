@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "leaflet/dist/leaflet.css";
 
 @theme {
   --font-sans: var(--font-body), ui-sans-serif, system-ui, sans-serif;
@@ -54,6 +55,11 @@ body {
 
 .leaflet-control-attribution a {
   color: #2dd4bf !important;
+}
+
+/* Softer heatmap so the base map reads through */
+.leaflet-heatmap-layer {
+  opacity: 0.6;
 }
 
 /* Story cards — full 1080×1920 canvas */

@@ -5,9 +5,11 @@ import { toPng } from "html-to-image";
 import { Download, Footprints, MapPin, Train } from "lucide-react";
 import type { NormalizedData } from "@/lib/parser";
 import { earthLaps, moonPercent, wrappedTitle } from "@/lib/parser";
+import type { RegionCount } from "@/lib/regions";
 
 interface StoryCardsProps {
   data: NormalizedData;
+  topRegions?: RegionCount[];
 }
 
 const CARD_W = 1080;
@@ -137,7 +139,10 @@ function StoryPreview({ children }: { children: ReactNode }) {
   );
 }
 
-export default function StoryCards({ data }: StoryCardsProps) {
+export default function StoryCards({
+  data,
+  topRegions = [],
+}: StoryCardsProps) {
   const card1Ref = useRef<HTMLDivElement>(null);
   const card2Ref = useRef<HTMLDivElement>(null);
   const card3Ref = useRef<HTMLDivElement>(null);
@@ -146,7 +151,7 @@ export default function StoryCards({ data }: StoryCardsProps) {
   const title = wrappedTitle(data.totalDistanceKm);
   const laps = earthLaps(data.totalDistanceKm);
   const moon = moonPercent(data.totalDistanceKm);
-  const top3 = data.topPlaces.slice(0, 3);
+  const top3 = topRegions.slice(0, 3);
 
   const activityTotals = data.activities.reduce(
     (acc, a) => {
@@ -262,19 +267,19 @@ export default function StoryCards({ data }: StoryCardsProps) {
                   style={{ width: 68, height: 68 }}
                 />
               }
-              heading="나의 최애 아지트"
-              subheading="Top 3 Places"
+              heading="나의 최애 지자체"
+              subheading="Top 3 Regions"
               footer={rangeLabel}
             >
               <ol className="flex flex-col" style={{ gap: 48 }}>
                 {top3.length === 0 && (
                   <li className="text-white/50" style={{ fontSize: 30 }}>
-                    방문 기록이 부족합니다
+                    지자체 기록이 부족합니다
                   </li>
                 )}
                 {top3.map((p, i) => (
                   <li
-                    key={p.name}
+                    key={p.id}
                     className="flex items-baseline gap-8 border-b border-white/10"
                     style={{ paddingBottom: 36 }}
                   >
@@ -292,7 +297,7 @@ export default function StoryCards({ data }: StoryCardsProps) {
                         {p.name}
                       </p>
                       <p className="mt-3 text-white/50" style={{ fontSize: 28 }}>
-                        {p.visitCount}회 방문
+                        체류 밀도 {p.count.toLocaleString()}
                       </p>
                     </div>
                   </li>

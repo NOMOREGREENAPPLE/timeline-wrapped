@@ -3,26 +3,34 @@
 import { useEffect, useMemo } from "react";
 import { MapContainer, TileLayer, useMap } from "react-leaflet";
 import L from "leaflet";
-import "leaflet/dist/leaflet.css";
 import "leaflet.heat";
 import type { Coordinate } from "@/lib/parser";
 
 const HEAT_THRESHOLD = 50_000;
 const TARGET_SAMPLES = 40_000;
-/** ~0.005° ≈ 550m grid — denser than 1km so hotspots stand out */
+/** ~0.005° ≈ 550m grid */
 const GRID_PRECISION = 200;
+/** Beyond this zoom, 550m bins look like discrete dots — lock the scale. */
+export const HEATMAP_MAX_ZOOM = 12;
 
 interface HeatmapViewProps {
   coordinates: Coordinate[];
   className?: string;
 }
 
+type HeatLatLng = [number, number, number];
+
+type HeatLayerInstance = L.Layer & {
+  setLatLngs: (latlngs: HeatLatLng[]) => HeatLayerInstance;
+  setOptions: (options: Record<string, unknown>) => HeatLayerInstance;
+};
+
 /**
- * Always bin into a grid so intensity = visit density (not a flat 0.6).
- * Above 50k points we keep the heaviest bins only (downsampling).
- * Gamma > 1 stretches high-density cells toward max intensity for contrast.
+ * Build heat points with intensity relative to THIS user's density distribution.
+ * Rank each cell by percentile within the loaded dataset, then apply a steep
+ * curve so only the user's own densest areas read as "hot"/red.
  */
-function densityPoints(coords: Coordinate[]): [number, number, number][] {
+function densityPoints(coords: Coordinate[]): HeatLatLng[] {
   if (coords.length === 0) return [];
 
   const bins = new Map<string, { lat: number; lng: number; w: number }>();
@@ -46,54 +54,81 @@ function densityPoints(coords: Coordinate[]): [number, number, number][] {
     points = points.slice(0, TARGET_SAMPLES);
   }
 
-  const maxW = Math.max(1, ...points.map((p) => p.w));
-  // Soft-cap at 95th percentile so one mega-hotspot doesn't wash out the rest,
-  // but rare cells stay near zero after gamma.
-  const weights = points.map((p) => p.w).sort((a, b) => a - b);
-  const p95 = weights[Math.floor(weights.length * 0.95)] ?? maxW;
-  const cap = Math.max(p95, 1);
+  const sortedWeights = points.map((p) => p.w).sort((a, b) => a - b);
+  const n = sortedWeights.length;
+  // Empirical CDF: same weight → same percentile (stable for ties)
+  const rankAt = (w: number) => {
+    let lo = 0;
+    let hi = n;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (sortedWeights[mid] < w) lo = mid + 1;
+      else hi = mid;
+    }
+    // upper bound for ties
+    let up = lo;
+    while (up < n && sortedWeights[up] === w) up++;
+    return n <= 1 ? 1 : (up - 1) / (n - 1);
+  };
 
   return points.map((p) => {
-    const normalized = Math.min(p.w / cap, 1);
-    // gamma 2.2 → sparse stays cool, dense → hot red
-    const intensity = Math.pow(normalized, 2.2);
-    return [p.lat, p.lng, 0.05 + 0.95 * intensity] as [
-      number,
-      number,
-      number,
-    ];
+    const percentile = rankAt(p.w); // 0..1 within this user's data
+    // Steep curve: bottom ~70% stay cool; only top densest go yellow→red
+    const intensity = Math.pow(percentile, 3.2);
+    return [p.lat, p.lng, 0.08 + 0.92 * intensity];
   });
 }
 
-function HeatLayer({ points }: { points: [number, number, number][] }) {
+function radiusForZoom(zoom: number): number {
+  return Math.round(18 + Math.max(0, zoom - 10) * 2);
+}
+
+function blurForZoom(zoom: number): number {
+  return Math.round(16 + Math.max(0, zoom - 10) * 1.2);
+}
+
+function HeatLayer({ points }: { points: HeatLatLng[] }) {
   const map = useMap();
 
   useEffect(() => {
-    const layer = (
-      L as typeof L & {
-        heatLayer: (
-          latlngs: [number, number, number][],
-          opts?: object
-        ) => L.Layer;
-      }
-    ).heatLayer(points, {
-      radius: 22,
-      blur: 18,
-      maxZoom: 17,
+    const zoom = map.getZoom();
+    const heatApi = L as typeof L & {
+      heatLayer: (
+        latlngs: HeatLatLng[],
+        opts?: Record<string, unknown>
+      ) => HeatLayerInstance;
+    };
+
+    const layer = heatApi.heatLayer(points, {
+      radius: radiusForZoom(zoom),
+      blur: blurForZoom(zoom),
+      maxZoom: 0,
       max: 1.0,
-      minOpacity: 0.15,
+      minOpacity: 0.12,
       gradient: {
         0.0: "#0c4a6e",
-        0.2: "#0f766e",
-        0.45: "#84cc16",
-        0.65: "#eab308",
-        0.82: "#f97316",
+        0.25: "#0f766e",
+        0.5: "#84cc16",
+        0.72: "#eab308",
+        0.88: "#f97316",
         1.0: "#ef4444",
       },
     });
 
     layer.addTo(map);
+
+    const syncZoomStyle = () => {
+      const z = map.getZoom();
+      layer.setOptions({
+        radius: radiusForZoom(z),
+        blur: blurForZoom(z),
+        maxZoom: 0,
+      });
+    };
+
+    map.on("zoomend", syncZoomStyle);
     return () => {
+      map.off("zoomend", syncZoomStyle);
       map.removeLayer(layer);
     };
   }, [map, points]);
@@ -109,7 +144,7 @@ function FitBounds({ coordinates }: { coordinates: Coordinate[] }) {
     const bounds = L.latLngBounds(
       coordinates.map((c) => [c.lat, c.lng] as [number, number])
     );
-    map.fitBounds(bounds, { padding: [40, 40], maxZoom: 12 });
+    map.fitBounds(bounds, { padding: [40, 40], maxZoom: 11 });
   }, [map, coordinates]);
 
   return null;
@@ -154,8 +189,8 @@ export default function HeatmapView({
           <h3 className="font-display text-base text-[var(--fg)]">이동 히트맵</h3>
           <p className="text-xs text-[var(--muted)]">
             {coordinates.length.toLocaleString()}개 좌표 → 밀도 격자{" "}
-            {binCount.toLocaleString()}셀
-            {downsampled ? " (상위 밀도로 샘플링)" : ""}
+            {binCount.toLocaleString()}셀 · 색상은 이 데이터 기준 상대 순위
+            {downsampled ? " · 상위 밀도 샘플링" : ""}
           </p>
         </div>
         <div className="flex items-center gap-2 text-[10px] text-[var(--muted)]">
@@ -173,12 +208,14 @@ export default function HeatmapView({
       <MapContainer
         center={center}
         zoom={11}
+        maxZoom={HEATMAP_MAX_ZOOM}
         scrollWheelZoom
         className="z-0 h-[420px] w-full bg-[#0a1210]"
       >
         <TileLayer
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>'
           url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
+          maxZoom={HEATMAP_MAX_ZOOM}
         />
         <HeatLayer points={heatPoints} />
         <FitBounds coordinates={coordinates} />
