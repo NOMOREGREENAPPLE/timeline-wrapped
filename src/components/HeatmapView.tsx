@@ -1,11 +1,7 @@
 "use client";
 
 import { useEffect, useMemo } from "react";
-import {
-  MapContainer,
-  TileLayer,
-  useMap,
-} from "react-leaflet";
+import { MapContainer, TileLayer, useMap } from "react-leaflet";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import "leaflet.heat";
@@ -13,28 +9,29 @@ import type { Coordinate } from "@/lib/parser";
 
 const HEAT_THRESHOLD = 50_000;
 const TARGET_SAMPLES = 40_000;
+/** ~0.005° ≈ 550m grid — denser than 1km so hotspots stand out */
+const GRID_PRECISION = 200;
 
 interface HeatmapViewProps {
   coordinates: Coordinate[];
   className?: string;
 }
 
-/** Weighted grid downsampling for 50k+ points */
-function downsample(coords: Coordinate[]): [number, number, number][] {
-  if (coords.length <= HEAT_THRESHOLD) {
-    return coords.map((c) => [c.lat, c.lng, 0.6]);
-  }
+/**
+ * Always bin into a grid so intensity = visit density (not a flat 0.6).
+ * Above 50k points we keep the heaviest bins only (downsampling).
+ * Gamma > 1 stretches high-density cells toward max intensity for contrast.
+ */
+function densityPoints(coords: Coordinate[]): [number, number, number][] {
+  if (coords.length === 0) return [];
 
-  // ~0.01° bins (~1km) — accumulate density as heat weight
   const bins = new Map<string, { lat: number; lng: number; w: number }>();
-  const precision = 100; // 0.01°
 
   for (const c of coords) {
-    const key = `${Math.round(c.lat * precision)}_${Math.round(c.lng * precision)}`;
+    const key = `${Math.round(c.lat * GRID_PRECISION)}_${Math.round(c.lng * GRID_PRECISION)}`;
     const existing = bins.get(key);
     if (existing) {
       existing.w += 1;
-      // running average of position inside bin
       existing.lat += (c.lat - existing.lat) / existing.w;
       existing.lng += (c.lng - existing.lng) / existing.w;
     } else {
@@ -45,24 +42,33 @@ function downsample(coords: Coordinate[]): [number, number, number][] {
   let points = [...bins.values()];
 
   if (points.length > TARGET_SAMPLES) {
-    // Keep heaviest bins
     points.sort((a, b) => b.w - a.w);
     points = points.slice(0, TARGET_SAMPLES);
   }
 
   const maxW = Math.max(1, ...points.map((p) => p.w));
-  return points.map((p) => [
-    p.lat,
-    p.lng,
-    0.3 + (0.7 * p.w) / maxW,
-  ]);
+  // Soft-cap at 95th percentile so one mega-hotspot doesn't wash out the rest,
+  // but rare cells stay near zero after gamma.
+  const weights = points.map((p) => p.w).sort((a, b) => a - b);
+  const p95 = weights[Math.floor(weights.length * 0.95)] ?? maxW;
+  const cap = Math.max(p95, 1);
+
+  return points.map((p) => {
+    const normalized = Math.min(p.w / cap, 1);
+    // gamma 2.2 → sparse stays cool, dense → hot red
+    const intensity = Math.pow(normalized, 2.2);
+    return [p.lat, p.lng, 0.05 + 0.95 * intensity] as [
+      number,
+      number,
+      number,
+    ];
+  });
 }
 
 function HeatLayer({ points }: { points: [number, number, number][] }) {
   const map = useMap();
 
   useEffect(() => {
-    // leaflet.heat augments L
     const layer = (
       L as typeof L & {
         heatLayer: (
@@ -71,17 +77,18 @@ function HeatLayer({ points }: { points: [number, number, number][] }) {
         ) => L.Layer;
       }
     ).heatLayer(points, {
-      radius: 18,
-      blur: 22,
+      radius: 22,
+      blur: 18,
       maxZoom: 17,
       max: 1.0,
-      minOpacity: 0.35,
+      minOpacity: 0.15,
       gradient: {
+        0.0: "#0c4a6e",
         0.2: "#0f766e",
-        0.4: "#14b8a6",
-        0.6: "#2dd4bf",
-        0.8: "#fbbf24",
-        1.0: "#f97316",
+        0.45: "#84cc16",
+        0.65: "#eab308",
+        0.82: "#f97316",
+        1.0: "#ef4444",
       },
     });
 
@@ -112,7 +119,9 @@ export default function HeatmapView({
   coordinates,
   className,
 }: HeatmapViewProps) {
-  const heatPoints = useMemo(() => downsample(coordinates), [coordinates]);
+  const heatPoints = useMemo(() => densityPoints(coordinates), [coordinates]);
+  const binCount = heatPoints.length;
+  const downsampled = coordinates.length > HEAT_THRESHOLD;
 
   const center = useMemo<[number, number]>(() => {
     if (coordinates.length === 0) return [37.5665, 126.978];
@@ -140,15 +149,25 @@ export default function HeatmapView({
         className ?? "",
       ].join(" ")}
     >
-      <div className="flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-4 py-3">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--border)] bg-[var(--surface)] px-4 py-3">
         <div>
           <h3 className="font-display text-base text-[var(--fg)]">이동 히트맵</h3>
           <p className="text-xs text-[var(--muted)]">
-            {coordinates.length.toLocaleString()}개 좌표
-            {coordinates.length > HEAT_THRESHOLD
-              ? ` → ${heatPoints.length.toLocaleString()}개로 샘플링`
-              : ""}
+            {coordinates.length.toLocaleString()}개 좌표 → 밀도 격자{" "}
+            {binCount.toLocaleString()}셀
+            {downsampled ? " (상위 밀도로 샘플링)" : ""}
           </p>
+        </div>
+        <div className="flex items-center gap-2 text-[10px] text-[var(--muted)]">
+          <span>적음</span>
+          <div
+            className="h-2 w-28 rounded-full"
+            style={{
+              background:
+                "linear-gradient(90deg,#0c4a6e,#0f766e,#84cc16,#eab308,#f97316,#ef4444)",
+            }}
+          />
+          <span>많음</span>
         </div>
       </div>
       <MapContainer

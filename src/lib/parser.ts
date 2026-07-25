@@ -9,6 +9,8 @@
 export interface Coordinate {
   lat: number;
   lng: number;
+  /** Epoch ms when known — used for date-range filtering */
+  t?: number;
 }
 
 export interface ActivityStat {
@@ -27,6 +29,21 @@ export interface NormalizedData {
   activities: ActivityStat[];
   topPlaces: TopPlace[];
   totalDistanceKm: number;
+  dateRange: { start: Date; end: Date };
+}
+
+/** Full parse result with timed events so the UI can re-slice by date range. */
+export interface TimelineBundle {
+  points: Coordinate[];
+  visits: { name: string; t: number | null }[];
+  activities: {
+    type: string;
+    distanceMeters: number;
+    durationMinutes: number;
+    t: number | null;
+  }[];
+  /** Distance contributions recorded during parse (path hops + activity distances) */
+  hops: { meters: number; t: number | null }[];
   dateRange: { start: Date; end: Date };
 }
 
@@ -57,6 +74,22 @@ const ACTIVITY_ALIASES: Record<string, string> = {
 
 type Loose = Record<string, unknown>;
 
+type ParseAcc = {
+  points: Coordinate[];
+  visits: { name: string; t: number | null }[];
+  activities: {
+    type: string;
+    distanceMeters: number;
+    durationMinutes: number;
+    t: number | null;
+  }[];
+  hops: { meters: number; t: number | null }[];
+};
+
+function emptyAcc(): ParseAcc {
+  return { points: [], visits: [], activities: [], hops: [] };
+}
+
 function isRecord(v: unknown): v is Loose {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
@@ -74,14 +107,13 @@ function toNumber(v: unknown): number | null {
 function fromE7(v: unknown): number | null {
   const n = toNumber(v);
   if (n === null) return null;
-  // Heuristic: values with |n| > 180 are almost certainly E7
   return Math.abs(n) > 180 ? n / 1e7 : n;
 }
 
 function parseCoordPair(
   latRaw: unknown,
   lngRaw: unknown
-): Coordinate | null {
+): { lat: number; lng: number } | null {
   const lat = fromE7(latRaw);
   const lng = fromE7(lngRaw);
   if (lat === null || lng === null) return null;
@@ -89,8 +121,7 @@ function parseCoordPair(
   return { lat, lng };
 }
 
-function parseLatLngString(s: string): Coordinate | null {
-  // "37.566535°, 126.9780°" or "37.566535,126.9780"
+function parseLatLngString(s: string): { lat: number; lng: number } | null {
   const cleaned = s.replace(/[°]/g, "").trim();
   const parts = cleaned.split(/[, ]+/).filter(Boolean);
   if (parts.length < 2) return null;
@@ -110,12 +141,7 @@ function firstDefined(o: Loose, keys: readonly string[]): unknown {
   return undefined;
 }
 
-/**
- * Pull a coordinate out of any Google Timeline node shape:
- * explicit E7 integer fields, plain decimal fields, or a "lat°, lng°" string.
- * E7 keys divide unconditionally so points near the equator stay correct.
- */
-function extractCoord(node: unknown): Coordinate | null {
+function extractCoord(node: unknown): { lat: number; lng: number } | null {
   if (typeof node === "string") return parseLatLngString(node);
   if (!isRecord(node)) return null;
 
@@ -156,13 +182,11 @@ function extractCoord(node: unknown): Coordinate | null {
 function parseTimestamp(v: unknown): Date | null {
   if (v == null) return null;
   if (typeof v === "number") {
-    // seconds vs ms
     const ms = v < 1e12 ? v * 1000 : v;
     const d = new Date(ms);
     return Number.isNaN(d.getTime()) ? null : d;
   }
   if (typeof v === "string") {
-    // Google sometimes uses "2024-01-01T12:00:00.000Z" or "2024-01-01T12:00:00Z"
     const d = new Date(v);
     return Number.isNaN(d.getTime()) ? null : d;
   }
@@ -179,7 +203,10 @@ function normalizeActivityType(raw: unknown): string {
   return ACTIVITY_ALIASES[key] ?? raw.trim();
 }
 
-function haversineMeters(a: Coordinate, b: Coordinate): number {
+function haversineMeters(
+  a: { lat: number; lng: number },
+  b: { lat: number; lng: number }
+): number {
   const R = 6_371_000;
   const toRad = (d: number) => (d * Math.PI) / 180;
   const dLat = toRad(b.lat - a.lat);
@@ -192,33 +219,43 @@ function haversineMeters(a: Coordinate, b: Coordinate): number {
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
 }
 
-function pushCoord(
-  coords: Coordinate[],
-  c: Coordinate | null,
-  dates: Date[],
+function pushPoint(
+  acc: ParseAcc,
+  c: { lat: number; lng: number } | null,
   date?: Date | null
 ) {
   if (!c) return;
-  coords.push(c);
-  if (date) dates.push(date);
+  acc.points.push({
+    lat: c.lat,
+    lng: c.lng,
+    ...(date ? { t: date.getTime() } : {}),
+  });
 }
 
-function mergeActivity(
-  map: Map<string, { distanceMeters: number; durationMinutes: number }>,
-  type: string,
-  distanceMeters: number,
-  durationMinutes: number
-) {
-  const prev = map.get(type) ?? { distanceMeters: 0, durationMinutes: 0 };
-  prev.distanceMeters += Math.max(0, distanceMeters);
-  prev.durationMinutes += Math.max(0, durationMinutes);
-  map.set(type, prev);
-}
-
-function bumpPlace(map: Map<string, number>, name: string) {
+function pushVisit(acc: ParseAcc, name: string, date?: Date | null) {
   const n = name.trim();
   if (!n || n === "Unknown" || n === "unknown") return;
-  map.set(n, (map.get(n) ?? 0) + 1);
+  acc.visits.push({ name: n, t: date ? date.getTime() : null });
+}
+
+function pushActivity(
+  acc: ParseAcc,
+  type: string,
+  distanceMeters: number,
+  durationMinutes: number,
+  date?: Date | null
+) {
+  acc.activities.push({
+    type,
+    distanceMeters: Math.max(0, distanceMeters),
+    durationMinutes: Math.max(0, durationMinutes),
+    t: date ? date.getTime() : null,
+  });
+}
+
+function pushHop(acc: ParseAcc, meters: number, date?: Date | null) {
+  if (meters <= 0) return;
+  acc.hops.push({ meters, t: date ? date.getTime() : null });
 }
 
 function durationMinutesBetween(start: Date | null, end: Date | null): number {
@@ -227,7 +264,23 @@ function durationMinutesBetween(start: Date | null, end: Date | null): number {
   return ms > 0 ? ms / 60_000 : 0;
 }
 
-// ─── Format detectors ───────────────────────────────────────────────
+export function startOfLocalDay(d: Date): Date {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+export function endOfLocalDay(d: Date): Date {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
+}
+
+function inRange(
+  t: number | null | undefined,
+  fromMs: number,
+  toMs: number,
+  includeUntimed: boolean
+): boolean {
+  if (t == null) return includeUntimed;
+  return t >= fromMs && t <= toMs;
+}
 
 function hasSemanticSegments(data: Loose): boolean {
   return Array.isArray(data.semanticSegments) || Array.isArray(data.timelinePath);
@@ -241,24 +294,8 @@ function hasLegacyLocations(data: Loose): boolean {
   return Array.isArray(data.locations);
 }
 
-// ─── Format 1: On-device (semanticSegments / timelinePath) ───────────
-
-function parseSemantic(data: Loose): {
-  coords: Coordinate[];
-  activities: Map<string, { distanceMeters: number; durationMinutes: number }>;
-  places: Map<string, number>;
-  dates: Date[];
-  distanceMeters: number;
-} {
-  const coords: Coordinate[] = [];
-  const activities = new Map<
-    string,
-    { distanceMeters: number; durationMinutes: number }
-  >();
-  const places = new Map<string, number>();
-  const dates: Date[] = [];
-  let distanceMeters = 0;
-
+function parseSemantic(data: Loose): ParseAcc {
+  const acc = emptyAcc();
   const segments = Array.isArray(data.semanticSegments)
     ? (data.semanticSegments as unknown[])
     : [];
@@ -268,25 +305,19 @@ function parseSemantic(data: Loose): {
 
     const start = parseTimestamp(seg.startTime ?? seg.startTimestamp);
     const end = parseTimestamp(seg.endTime ?? seg.endTimestamp);
-    if (start) dates.push(start);
-    if (end) dates.push(end);
 
-    // timelinePath inside segment: [{ point: "lat°, lng°", time }, ...]
     if (Array.isArray(seg.timelinePath)) {
-      let prev: Coordinate | null = null;
+      let prev: { lat: number; lng: number } | null = null;
       for (const p of seg.timelinePath) {
         if (!isRecord(p)) continue;
         const point = extractCoord(p);
-        const t = parseTimestamp(p.time ?? p.timestamp);
-        pushCoord(coords, point, dates, t);
-        if (point && prev) {
-          distanceMeters += haversineMeters(prev, point);
-        }
+        const t = parseTimestamp(p.time ?? p.timestamp) ?? start;
+        pushPoint(acc, point, t);
+        if (point && prev) pushHop(acc, haversineMeters(prev, point), t);
         prev = point;
       }
     }
 
-    // visit
     const visit = isRecord(seg.visit) ? seg.visit : null;
     if (visit) {
       const topCandidate = isRecord(visit.topCandidate)
@@ -318,13 +349,11 @@ function parseSemantic(data: Loose): {
         "";
 
       if (typeof nameCandidate === "string" && nameCandidate) {
-        bumpPlace(places, nameCandidate);
+        pushVisit(acc, nameCandidate, start);
       }
-
-      pushCoord(coords, extractCoord(place), dates, start);
+      pushPoint(acc, extractCoord(place), start);
     }
 
-    // activity
     const activity = isRecord(seg.activity) ? seg.activity : null;
     if (activity) {
       const topCandidate = isRecord(activity.topCandidate)
@@ -338,54 +367,35 @@ function parseSemantic(data: Loose): {
         toNumber(topCandidate?.distanceMeters) ??
         0;
       const dur = durationMinutesBetween(start, end);
-      mergeActivity(activities, type, dist, dur);
-      distanceMeters += dist;
-
-      pushCoord(coords, extractCoord(activity.start), dates, start);
-      pushCoord(coords, extractCoord(activity.end), dates, end);
+      pushActivity(acc, type, dist, dur, start);
+      pushHop(acc, dist, start);
+      pushPoint(acc, extractCoord(activity.start), start);
+      pushPoint(acc, extractCoord(activity.end), end);
     }
   }
 
-  // Top-level timelinePath
   if (Array.isArray(data.timelinePath)) {
-    let prev: Coordinate | null = null;
+    let prev: { lat: number; lng: number } | null = null;
     for (const p of data.timelinePath as unknown[]) {
       if (!isRecord(p)) continue;
       const point = extractCoord(p);
       const t = parseTimestamp(p.time ?? p.timestamp);
-      pushCoord(coords, point, dates, t);
-      if (point && prev) distanceMeters += haversineMeters(prev, point);
+      pushPoint(acc, point, t);
+      if (point && prev) pushHop(acc, haversineMeters(prev, point), t);
       prev = point;
     }
   }
 
-  return { coords, activities, places, dates, distanceMeters };
+  return acc;
 }
 
-// ─── Format 2: Takeout timelineObjects ──────────────────────────────
-
-function parseTimelineObjects(data: Loose): {
-  coords: Coordinate[];
-  activities: Map<string, { distanceMeters: number; durationMinutes: number }>;
-  places: Map<string, number>;
-  dates: Date[];
-  distanceMeters: number;
-} {
-  const coords: Coordinate[] = [];
-  const activities = new Map<
-    string,
-    { distanceMeters: number; durationMinutes: number }
-  >();
-  const places = new Map<string, number>();
-  const dates: Date[] = [];
-  let distanceMeters = 0;
-
+function parseTimelineObjects(data: Loose): ParseAcc {
+  const acc = emptyAcc();
   const objects = data.timelineObjects as unknown[];
 
   for (const obj of objects) {
     if (!isRecord(obj)) continue;
 
-    // placeVisit
     if (isRecord(obj.placeVisit)) {
       const pv = obj.placeVisit;
       const loc = isRecord(pv.location) ? pv.location : null;
@@ -394,20 +404,17 @@ function parseTimelineObjects(data: Loose): {
         (typeof loc?.address === "string" && loc.address) ||
         (typeof loc?.placeId === "string" && loc.placeId) ||
         "";
-      if (name) bumpPlace(places, name);
+      const start =
+        parseTimestamp(
+          isRecord(pv.duration)
+            ? pv.duration.startTimestampMs ?? pv.duration.startTimestamp
+            : null
+        ) ?? parseTimestamp(pv.startTimestampMs ?? pv.startTimestamp);
 
-      const c = extractCoord(loc);
-      const start = parseTimestamp(
-        isRecord(pv.duration) ? pv.duration.startTimestampMs ?? pv.duration.startTimestamp : null
-      ) ?? parseTimestamp(pv.startTimestampMs ?? pv.startTimestamp);
-      const end = parseTimestamp(
-        isRecord(pv.duration) ? pv.duration.endTimestampMs ?? pv.duration.endTimestamp : null
-      ) ?? parseTimestamp(pv.endTimestampMs ?? pv.endTimestamp);
-      pushCoord(coords, c, dates, start);
-      if (end) dates.push(end);
+      if (name) pushVisit(acc, name, start);
+      pushPoint(acc, extractCoord(loc), start);
     }
 
-    // activitySegment
     if (isRecord(obj.activitySegment)) {
       const asg = obj.activitySegment;
       const type = normalizeActivityType(
@@ -428,15 +435,14 @@ function parseTimelineObjects(data: Loose): {
           ? asg.duration.endTimestampMs ?? asg.duration.endTimestamp
           : asg.endTimestampMs ?? asg.endTimestamp
       );
-      mergeActivity(activities, type, dist, durationMinutesBetween(start, end));
-      distanceMeters += dist;
+      pushActivity(acc, type, dist, durationMinutesBetween(start, end), start);
+      pushHop(acc, dist, start);
 
       const startLoc = extractCoord(asg.startLocation);
       const endLoc = extractCoord(asg.endLocation);
-      pushCoord(coords, startLoc, dates, start);
-      pushCoord(coords, endLoc, dates, end);
+      pushPoint(acc, startLoc, start);
+      pushPoint(acc, endLoc, end);
 
-      // waypointPath / simplifiedPath
       const path = Array.isArray(asg.waypointPath)
         ? asg.waypointPath
         : isRecord(asg.waypointPath) &&
@@ -449,46 +455,29 @@ function parseTimelineObjects(data: Loose): {
               ? ((asg.simplifiedRawPath as Loose).points as unknown[])
               : [];
 
-      let prev: Coordinate | null = startLoc;
+      let prev: { lat: number; lng: number } | null = startLoc;
       for (const wp of path) {
         if (!isRecord(wp)) continue;
         const c = extractCoord(wp);
-        pushCoord(coords, c, dates, parseTimestamp(wp.timestampMs ?? wp.timestamp));
+        const t = parseTimestamp(wp.timestampMs ?? wp.timestamp) ?? start;
+        pushPoint(acc, c, t);
         if (c && prev && dist === 0) {
-          distanceMeters += haversineMeters(prev, c);
+          pushHop(acc, haversineMeters(prev, c), t);
         }
         if (c) prev = c;
       }
     }
   }
 
-  return { coords, activities, places, dates, distanceMeters };
+  return acc;
 }
 
-// ─── Format 3: Legacy locations[] ───────────────────────────────────
-
-function parseLegacyLocations(data: Loose): {
-  coords: Coordinate[];
-  activities: Map<string, { distanceMeters: number; durationMinutes: number }>;
-  places: Map<string, number>;
-  dates: Date[];
-  distanceMeters: number;
-} {
-  const coords: Coordinate[] = [];
-  const activities = new Map<
-    string,
-    { distanceMeters: number; durationMinutes: number }
-  >();
-  const places = new Map<string, number>();
-  const dates: Date[] = [];
-  let distanceMeters = 0;
-
+function parseLegacyLocations(data: Loose): ParseAcc {
+  const acc = emptyAcc();
   const locations = data.locations as unknown[];
-  let prev: Coordinate | null = null;
+  let prev: { lat: number; lng: number } | null = null;
   let prevTime: Date | null = null;
 
-  // Raw GPS pings are noisy: drop low-accuracy fixes, ignore sub-15m jitter,
-  // and cap single hops so a bad fix cannot add hundreds of km.
   const MAX_ACCURACY_M = 500;
   const MIN_HOP_M = 15;
   const MAX_HOP_M = 50_000;
@@ -501,15 +490,13 @@ function parseLegacyLocations(data: Loose): {
 
     const c = extractCoord(loc);
     const t = parseTimestamp(loc.timestampMs ?? loc.timestamp ?? loc.time);
-    pushCoord(coords, c, dates, t);
+    pushPoint(acc, c, t);
 
     if (c && prev) {
       const d = haversineMeters(prev, c);
-      if (d >= MIN_HOP_M && d < MAX_HOP_M) distanceMeters += d;
+      if (d >= MIN_HOP_M && d < MAX_HOP_M) pushHop(acc, d, t);
     }
 
-    // Records.json nests candidates as activity[].activity[]; older exports
-    // put {type, confidence} directly in the outer array.
     const buckets = Array.isArray(loc.activity)
       ? loc.activity
       : Array.isArray(loc.activities)
@@ -525,18 +512,22 @@ function parseLegacyLocations(data: Loose): {
         : [bucket];
       const best = candidates
         .filter(isRecord)
-        .sort((a, b) => (toNumber(b.confidence) ?? 0) - (toNumber(a.confidence) ?? 0))[0];
+        .sort(
+          (a, b) =>
+            (toNumber(b.confidence) ?? 0) - (toNumber(a.confidence) ?? 0)
+        )[0];
       if (!best) continue;
       const conf = toNumber(best.confidence) ?? 0;
       if (conf > 0 && conf < 50) continue;
       const type = normalizeActivityType(
         best.type ?? best.activity ?? best.activityType
       );
-      mergeActivity(
-        activities,
+      pushActivity(
+        acc,
         type,
         0,
-        durationMinutes / Math.max(buckets.length, 1)
+        durationMinutes / Math.max(buckets.length, 1),
+        t
       );
     }
 
@@ -544,104 +535,168 @@ function parseLegacyLocations(data: Loose): {
     if (t) prevTime = t;
   }
 
-  return { coords, activities, places, dates, distanceMeters };
+  return acc;
 }
 
-// ─── Public API ─────────────────────────────────────────────────────
+function spanOf(acc: ParseAcc): { start: Date; end: Date } {
+  let min = Infinity;
+  let max = -Infinity;
+  const consider = (t: number | null | undefined) => {
+    if (t == null) return;
+    if (t < min) min = t;
+    if (t > max) max = t;
+  };
+  for (const p of acc.points) consider(p.t);
+  for (const v of acc.visits) consider(v.t);
+  for (const a of acc.activities) consider(a.t);
+  for (const h of acc.hops) consider(h.t);
 
-function finalize(partial: {
-  coords: Coordinate[];
-  activities: Map<string, { distanceMeters: number; durationMinutes: number }>;
-  places: Map<string, number>;
-  dates: Date[];
-  distanceMeters: number;
-}): NormalizedData {
-  const activities: ActivityStat[] = [...partial.activities.entries()]
+  if (!Number.isFinite(min) || !Number.isFinite(max)) {
+    const now = new Date();
+    return { start: now, end: now };
+  }
+  return { start: new Date(min), end: new Date(max) };
+}
+
+function toBundle(acc: ParseAcc): TimelineBundle {
+  return {
+    points: acc.points,
+    visits: acc.visits,
+    activities: acc.activities,
+    hops: acc.hops,
+    dateRange: spanOf(acc),
+  };
+}
+
+/**
+ * Aggregate a timeline bundle into dashboard stats.
+ * When `range` is given, only events whose timestamp falls inside
+ * [startOfDay(from), endOfDay(to)] are included. Events without a
+ * timestamp stay in only when the selected range covers the full span.
+ */
+export function aggregateBundle(
+  bundle: TimelineBundle,
+  range?: { start: Date; end: Date } | null
+): NormalizedData {
+  const fullFrom = startOfLocalDay(bundle.dateRange.start).getTime();
+  const fullTo = endOfLocalDay(bundle.dateRange.end).getTime();
+
+  const fromMs = range ? startOfLocalDay(range.start).getTime() : fullFrom;
+  const toMs = range ? endOfLocalDay(range.end).getTime() : fullTo;
+
+  const isFullSpan = fromMs <= fullFrom && toMs >= fullTo;
+  const includeUntimed = isFullSpan;
+
+  const coordinates = bundle.points.filter((p) =>
+    inRange(p.t, fromMs, toMs, includeUntimed)
+  );
+
+  const placeMap = new Map<string, number>();
+  for (const v of bundle.visits) {
+    if (!inRange(v.t, fromMs, toMs, includeUntimed)) continue;
+    placeMap.set(v.name, (placeMap.get(v.name) ?? 0) + 1);
+  }
+  const topPlaces: TopPlace[] = [...placeMap.entries()]
+    .map(([name, visitCount]) => ({ name, visitCount }))
+    .sort((a, b) => b.visitCount - a.visitCount)
+    .slice(0, 20);
+
+  const actMap = new Map<
+    string,
+    { distanceMeters: number; durationMinutes: number }
+  >();
+  for (const a of bundle.activities) {
+    if (!inRange(a.t, fromMs, toMs, includeUntimed)) continue;
+    if (a.type === "정지") continue;
+    const prev = actMap.get(a.type) ?? {
+      distanceMeters: 0,
+      durationMinutes: 0,
+    };
+    prev.distanceMeters += a.distanceMeters;
+    prev.durationMinutes += a.durationMinutes;
+    actMap.set(a.type, prev);
+  }
+  const activities: ActivityStat[] = [...actMap.entries()]
     .map(([type, v]) => ({
       type,
       distanceMeters: v.distanceMeters,
       durationMinutes: Math.round(v.durationMinutes * 10) / 10,
     }))
-    .filter((a) => a.type !== "정지")
     .sort(
       (a, b) =>
-        b.distanceMeters + b.durationMinutes * 50 -
+        b.distanceMeters +
+        b.durationMinutes * 50 -
         (a.distanceMeters + a.durationMinutes * 50)
     );
 
-  const topPlaces: TopPlace[] = [...partial.places.entries()]
-    .map(([name, visitCount]) => ({ name, visitCount }))
-    .sort((a, b) => b.visitCount - a.visitCount)
-    .slice(0, 20);
+  let meters = 0;
+  for (const h of bundle.hops) {
+    if (!inRange(h.t, fromMs, toMs, includeUntimed)) continue;
+    meters += h.meters;
+  }
 
-  let start = new Date();
-  let end = new Date(0);
-  if (partial.dates.length > 0) {
-    start = partial.dates[0];
-    end = partial.dates[0];
-    for (const d of partial.dates) {
-      if (d < start) start = d;
-      if (d > end) end = d;
-    }
-  } else {
-    start = new Date();
-    end = new Date();
+  let start = range ? startOfLocalDay(range.start) : bundle.dateRange.start;
+  let end = range ? endOfLocalDay(range.end) : bundle.dateRange.end;
+  let minTime = Infinity;
+  let maxTime = -Infinity;
+  for (const coordinate of coordinates) {
+    if (coordinate.t == null) continue;
+    if (coordinate.t < minTime) minTime = coordinate.t;
+    if (coordinate.t > maxTime) maxTime = coordinate.t;
+  }
+  if (Number.isFinite(minTime) && Number.isFinite(maxTime)) {
+    start = new Date(minTime);
+    end = new Date(maxTime);
   }
 
   return {
-    coordinates: partial.coords,
+    coordinates,
     activities,
     topPlaces,
-    totalDistanceKm: Math.round((partial.distanceMeters / 1000) * 10) / 10,
+    totalDistanceKm: Math.round((meters / 1000) * 10) / 10,
     dateRange: { start, end },
   };
 }
 
-/**
- * Parse a Google Timeline / Records JSON object into NormalizedData.
- * Safe for large payloads — single-pass, guarded with try/catch.
- */
-export function parseTimelineJson(raw: unknown): NormalizedData {
+export function parseTimelineJson(raw: unknown): TimelineBundle {
   try {
     if (!isRecord(raw)) {
       throw new Error("JSON 루트가 객체가 아닙니다.");
     }
 
-    let partial;
+    let acc: ParseAcc;
     if (hasSemanticSegments(raw)) {
-      partial = parseSemantic(raw);
+      acc = parseSemantic(raw);
     } else if (hasTimelineObjects(raw)) {
-      partial = parseTimelineObjects(raw);
+      acc = parseTimelineObjects(raw);
     } else if (hasLegacyLocations(raw)) {
-      partial = parseLegacyLocations(raw);
+      acc = parseLegacyLocations(raw);
+    } else if (
+      isRecord(raw.timelineData) &&
+      hasSemanticSegments(raw.timelineData as Loose)
+    ) {
+      acc = parseSemantic(raw.timelineData as Loose);
     } else {
-      // Fallback: scan for any known nested keys
-      if (isRecord(raw.timelineData) && hasSemanticSegments(raw.timelineData as Loose)) {
-        partial = parseSemantic(raw.timelineData as Loose);
-      } else {
-        throw new Error(
-          "지원하지 않는 JSON 형식입니다. Timeline.json 또는 Records.json을 확인해 주세요."
-        );
-      }
+      throw new Error(
+        "지원하지 않는 JSON 형식입니다. Timeline.json 또는 Records.json을 확인해 주세요."
+      );
     }
 
-    if (partial.coords.length === 0 && partial.places.size === 0) {
-      throw new Error("위치 데이터를 찾을 수 없습니다. 파일 내용을 확인해 주세요.");
+    if (acc.points.length === 0 && acc.visits.length === 0) {
+      throw new Error(
+        "위치 데이터를 찾을 수 없습니다. 파일 내용을 확인해 주세요."
+      );
     }
 
-    return finalize(partial);
+    return toBundle(acc);
   } catch (err) {
     if (err instanceof Error) throw err;
     throw new Error("JSON 파싱 중 알 수 없는 오류가 발생했습니다.");
   }
 }
 
-/**
- * Read a File as text and parse it. Yields to the event loop before heavy work.
- */
-export async function parseTimelineFile(file: File): Promise<NormalizedData> {
+export async function parseTimelineFile(file: File): Promise<TimelineBundle> {
   const text = await file.text();
-  // Yield so the browser can paint the loading UI before JSON.parse
   await new Promise<void>((r) => setTimeout(r, 0));
   let raw: unknown;
   try {
@@ -651,6 +706,18 @@ export async function parseTimelineFile(file: File): Promise<NormalizedData> {
   }
   await new Promise<void>((r) => setTimeout(r, 0));
   return parseTimelineJson(raw);
+}
+
+export function toInputDate(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+export function fromInputDate(s: string): Date {
+  const [y, m, d] = s.split("-").map(Number);
+  return new Date(y, m - 1, d);
 }
 
 export function earthLaps(totalDistanceKm: number): number {

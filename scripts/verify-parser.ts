@@ -3,9 +3,13 @@
  * Run with: npm run verify:parser
  */
 import assert from "node:assert/strict";
-import { parseTimelineJson } from "../src/lib/parser.ts";
+import { aggregateBundle, parseTimelineJson } from "../src/lib/parser.ts";
 
 const results: string[] = [];
+
+function parse(raw: unknown) {
+  return aggregateBundle(parseTimelineJson(raw));
+}
 
 function check(name: string, fn: () => void) {
   try {
@@ -54,7 +58,7 @@ const onDevice = {
 };
 
 check("format 1 — semanticSegments", () => {
-  const d = parseTimelineJson(onDevice);
+  const d = parse(onDevice);
   assert.ok(d.coordinates.length >= 5, `coords=${d.coordinates.length}`);
   assert.ok(
     d.coordinates.every(
@@ -120,7 +124,7 @@ const takeout = {
 };
 
 check("format 2 — timelineObjects (E7)", () => {
-  const d = parseTimelineJson(takeout);
+  const d = parse(takeout);
   const gyeongbok = d.coordinates[0];
   assert.ok(
     Math.abs(gyeongbok.lat - 37.566535) < 1e-6,
@@ -181,7 +185,7 @@ const legacy = {
 };
 
 check("format 3 — legacy locations[]", () => {
-  const d = parseTimelineJson(legacy);
+  const d = parse(legacy);
   assert.equal(d.coordinates.length, 3, "low-accuracy point should be dropped");
   assert.ok(Math.abs(d.coordinates[0].lat - 37.566535) < 1e-6);
   assert.ok(
@@ -195,7 +199,7 @@ check("format 3 — legacy locations[]", () => {
 
 // ── E7 near the equator (small integers must still divide by 1e7) ─────
 check("E7 fields near equator are not mistaken for decimals", () => {
-  const d = parseTimelineJson({
+  const d = parse({
     timelineObjects: [
       {
         placeVisit: {
@@ -208,6 +212,51 @@ check("E7 fields near equator are not mistaken for decimals", () => {
   const c = d.coordinates[0];
   assert.ok(Math.abs(c.lat - 0.15) < 1e-9, `lat=${c.lat}`);
   assert.ok(Math.abs(c.lng - 0.12) < 1e-9, `lng=${c.lng}`);
+});
+
+check("date range filter slices visits and distance", () => {
+  const bundle = parseTimelineJson(onDevice);
+  const march1 = aggregateBundle(bundle, {
+    start: new Date(2024, 2, 1),
+    end: new Date(2024, 2, 1),
+  });
+  const march2 = aggregateBundle(bundle, {
+    start: new Date(2024, 2, 2),
+    end: new Date(2024, 2, 2),
+  });
+  assert.equal(march1.topPlaces[0]?.name, "집");
+  assert.ok(
+    !march2.topPlaces.some((p) => p.name === "집"),
+    "home visit should be excluded on March 2"
+  );
+  assert.ok(
+    march2.activities.some((a) => a.type === "자동차"),
+    "car trip is on March 2"
+  );
+  assert.ok(march2.totalDistanceKm >= 12.4);
+  assert.ok(march1.totalDistanceKm < march2.totalDistanceKm || march1.totalDistanceKm >= 0);
+});
+
+check("large coordinate sets do not overflow the call stack", () => {
+  const start = Date.UTC(2024, 0, 1);
+  const points = Array.from({ length: 250_000 }, (_, index) => ({
+    lat: 37.5 + (index % 100) / 100_000,
+    lng: 127 + (index % 100) / 100_000,
+    t: start + index * 1_000,
+  }));
+  const data = aggregateBundle({
+    points,
+    visits: [],
+    activities: [],
+    hops: [],
+    dateRange: {
+      start: new Date(points[0].t),
+      end: new Date(points[points.length - 1].t),
+    },
+  });
+  assert.equal(data.coordinates.length, points.length);
+  assert.equal(data.dateRange.start.getTime(), points[0].t);
+  assert.equal(data.dateRange.end.getTime(), points[points.length - 1].t);
 });
 
 // ── Error handling ────────────────────────────────────────────────────

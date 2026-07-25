@@ -1,14 +1,18 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useCallback, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Compass, RotateCcw, Sparkles } from "lucide-react";
+import DateRangePicker, {
+  type DateRangeValue,
+} from "@/components/DateRangePicker";
 import FileUploader from "@/components/FileUploader";
 import QuickStats from "@/components/QuickStats";
 import StoryCards from "@/components/StoryCards";
 import {
+  aggregateBundle,
   parseTimelineFile,
-  type NormalizedData,
+  type TimelineBundle,
 } from "@/lib/parser";
 
 const HeatmapView = dynamic(() => import("@/components/HeatmapView"), {
@@ -21,17 +25,22 @@ const HeatmapView = dynamic(() => import("@/components/HeatmapView"), {
 });
 
 export default function HomePage() {
-  const [data, setData] = useState<NormalizedData | null>(null);
+  const [bundle, setBundle] = useState<TimelineBundle | null>(null);
+  const [range, setRange] = useState<DateRangeValue | null>(null);
   const [isParsing, setIsParsing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
+
+  const data = useMemo(
+    () => (bundle ? aggregateBundle(bundle, range) : null),
+    [bundle, range]
+  );
 
   const handleFile = useCallback(async (file: File) => {
     setIsParsing(true);
     setError(null);
     setProgress(12);
     try {
-      // Fake progress ticks while FileReader + JSON.parse run
       const tick = window.setInterval(() => {
         setProgress((p) => (p < 85 ? p + Math.random() * 12 : p));
       }, 180);
@@ -39,10 +48,15 @@ export default function HomePage() {
       const parsed = await parseTimelineFile(file);
       window.clearInterval(tick);
       setProgress(100);
-      setData(parsed);
+      setBundle(parsed);
+      setRange({
+        start: parsed.dateRange.start,
+        end: parsed.dateRange.end,
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : "파싱에 실패했습니다.");
-      setData(null);
+      setBundle(null);
+      setRange(null);
     } finally {
       setIsParsing(false);
       setProgress(0);
@@ -50,7 +64,8 @@ export default function HomePage() {
   }, []);
 
   const reset = useCallback(() => {
-    setData(null);
+    setBundle(null);
+    setRange(null);
     setError(null);
     setProgress(0);
   }, []);
@@ -72,7 +87,7 @@ export default function HomePage() {
               </p>
             </div>
           </div>
-          {data && (
+          {bundle && (
             <button
               type="button"
               onClick={reset}
@@ -84,7 +99,7 @@ export default function HomePage() {
           )}
         </div>
 
-        {!data && (
+        {!bundle && (
           <div className="mt-10 max-w-2xl">
             <h1 className="font-display text-3xl leading-tight tracking-tight text-[var(--fg)] sm:text-4xl">
               올해의{" "}
@@ -102,7 +117,7 @@ export default function HomePage() {
         )}
       </header>
 
-      {!data ? (
+      {!bundle || !data || !range ? (
         <div className="animate-fade-up-delay">
           <FileUploader
             onParsed={handleFile}
@@ -113,6 +128,12 @@ export default function HomePage() {
         </div>
       ) : (
         <div className="space-y-12 animate-fade-up">
+          <DateRangePicker
+            bundle={bundle}
+            value={range}
+            onChange={setRange}
+          />
+
           <section>
             <div className="mb-4 flex flex-wrap items-end justify-between gap-2">
               <div>
